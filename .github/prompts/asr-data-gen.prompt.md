@@ -139,17 +139,25 @@ ALL_STYLES: list[str]  # module-level constant: generate_unique_styles(150)
 ### Imports and Setup
 
 ```python
-import argparse, csv, hashlib, os, time, wave
+import argparse, base64, csv, hashlib, os, time, uuid, wave
 from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from tqdm import tqdm
 from google import genai
 from google.genai import types
+from langsmith import Client as LangSmithClient
+from langsmith.run_helpers import traceable
 from speaking_styles import generate_unique_styles
 
 load_dotenv()
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]  # hard-fail if missing
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]       # hard-fail if missing
+LANGSMITH_API_KEY = os.environ["LANGSMITH_API_KEY"] # hard-fail if missing
+LANGSMITH_PROJECT = os.environ.get("LANGSMITH_PROJECT", "asr-data-gen")
+
+# Tell the LangSmith SDK which project to log to
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = LANGSMITH_PROJECT
 ```
 
 ### Available Voices
@@ -283,6 +291,100 @@ Batch input cost (Gemini 2.5 Pro Preview TTS): $0.50 / 1M tokens
 Estimated cost: ~${estimated_cost:.4f}
 ```
 
+### LangSmith Cost Tracking
+
+Use **LangSmith** to log every TTS request, its token usage, and cumulative cost for the run.
+
+#### Setup
+
+Initialise a `LangSmithClient` once at startup and create a top-level run for the whole pipeline session:
+
+```python
+ls_client = LangSmithClient()  # reads LANGSMITH_API_KEY from env automatically
+SESSION_RUN_ID = str(uuid.uuid4())
+
+def create_pipeline_run(model: str, input_csv: str, total_rows: int) -> str:
+    """Create a top-level LangSmith run for the full pipeline execution."""
+    run = ls_client.create_run(
+        name="asr-data-gen-pipeline",
+        run_type="chain",
+        inputs={
+            "model": model,
+            "input_csv": input_csv,
+            "total_rows": total_rows,
+        },
+        project_name=LANGSMITH_PROJECT,
+        id=SESSION_RUN_ID,
+    )
+    return run.id
+```
+
+#### Per-Batch Logging
+
+After each sub-batch job completes, log a child run with the token usage and computed cost:
+
+```python
+# Token counts come from the batch job metadata when available,
+# otherwise fall back to character-based estimates.
+def log_batch_to_langsmith(
+    parent_run_id: str,
+    batch_index: int,
+    model: str,
+    num_requests: int,
+    input_chars: int,
+    output_audio_tokens: int,
+    input_tokens: int,
+):
+    # Pricing constants (Batch API, paid tier)
+    INPUT_PRICE_PER_1M  = 0.50   # USD — gemini-2.5-pro-preview-tts text input
+    OUTPUT_PRICE_PER_1M = 10.00  # USD — gemini-2.5-pro-preview-tts audio output
+    # Flash batch prices would be 0.25 / 5.00 respectively
+
+    input_cost  = (input_tokens  / 1_000_000) * INPUT_PRICE_PER_1M
+    output_cost = (output_audio_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
+    total_cost  = input_cost + output_cost
+
+    ls_client.create_run(
+        name=f"tts-batch-{batch_index}",
+        run_type="llm",
+        parent_run_id=parent_run_id,
+        project_name=LANGSMITH_PROJECT,
+        inputs={"num_requests": num_requests, "input_chars": input_chars},
+        outputs={
+            "input_tokens": input_tokens,
+            "output_audio_tokens": output_audio_tokens,
+            "input_cost_usd": round(input_cost, 6),
+            "output_cost_usd": round(output_cost, 6),
+            "total_cost_usd": round(total_cost, 6),
+        },
+        extra={"model": model},
+        end_time=...,   # datetime.utcnow()
+    )
+    return total_cost
+```
+
+#### Session Summary
+
+After all batches finish, close the top-level run with cumulative totals:
+
+```python
+def close_pipeline_run(parent_run_id: str, total_cost: float, files_saved: int, files_skipped: int):
+    ls_client.update_run(
+        run_id=parent_run_id,
+        outputs={
+            "total_cost_usd": round(total_cost, 6),
+            "files_saved": files_saved,
+            "files_skipped": files_skipped,
+        },
+        end_time=...,   # datetime.utcnow()
+    )
+```
+
+Print a summary line after closing:
+```
+LangSmith run: https://smith.langchain.com/projects/{LANGSMITH_PROJECT} | Total cost: ~${total_cost:.4f}
+```
+
 ### Output CSV
 
 After all audio is saved, write `--output` CSV with these columns:
@@ -306,6 +408,7 @@ google-genai>=0.8.0
 python-dotenv>=1.0.0
 tqdm>=4.66.0
 pandas>=2.0.0
+langsmith>=0.1.0
 ```
 
 ---
@@ -314,6 +417,8 @@ pandas>=2.0.0
 
 ```
 GEMINI_API_KEY=your_gemini_api_key_here
+LANGSMITH_API_KEY=your_langsmith_api_key_here
+LANGSMITH_PROJECT=asr-data-gen
 ```
 
 ---
