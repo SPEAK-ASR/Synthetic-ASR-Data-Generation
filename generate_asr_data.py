@@ -228,10 +228,19 @@ def _process_batch_api(
     failed_indices: list[int] = []
     output_audio_tokens = 0
 
-    for i, response in enumerate(job.responses):
+    for i, inlined_resp in enumerate(job.dest.inlined_responses):
         idx, filename, text, style, voice = sub_batch[i]
         try:
-            audio_data = response.candidates[0].content.parts[0].inline_data.data
+            if inlined_resp.error:
+                raise RuntimeError(inlined_resp.error)
+            response = inlined_resp.response
+            if not response or not response.candidates:
+                raise RuntimeError("No candidates in response")
+            candidate = response.candidates[0]
+            if candidate.content is None:
+                finish = candidate.finish_reason.name if candidate.finish_reason else "UNKNOWN"
+                raise RuntimeError(f"Empty content (finish_reason={finish})")
+            audio_data = candidate.content.parts[0].inline_data.data
             pcm_bytes = audio_data
             filepath = data_dir / filename
             save_wave(filepath, pcm_bytes)
@@ -281,7 +290,13 @@ def _process_sequential_fallback(
                     ),
                 ),
             )
-            audio_data = response.candidates[0].content.parts[0].inline_data.data
+            if not response or not response.candidates:
+                raise RuntimeError("No candidates in response")
+            candidate = response.candidates[0]
+            if candidate.content is None:
+                finish = candidate.finish_reason.name if candidate.finish_reason else "UNKNOWN"
+                raise RuntimeError(f"Empty content (finish_reason={finish})")
+            audio_data = candidate.content.parts[0].inline_data.data
             pcm_bytes = audio_data
             filepath = data_dir / filename
             save_wave(filepath, pcm_bytes)
@@ -408,7 +423,7 @@ def main() -> None:
     all_failed: list[int] = []
     cumulative_cost = 0.0
 
-    use_batch_api = False
+    use_batch_api = True
 
     for bi, sub_batch in enumerate(tqdm(sub_batches, desc="Batches")):
         input_chars = sum(len(r[2]) + len(r[3]) for r in sub_batch)
@@ -449,6 +464,27 @@ def main() -> None:
             f"  Batch {bi}: saved={len(saved)}, failed={len(failed)}, "
             f"batch_cost=${batch_cost:.4f}"
         )
+
+    # ---- Retry failed rows sequentially ----
+    if all_failed:
+        print(f"\nRetrying {len(all_failed)} failed rows sequentially...")
+        failed_rows = [r for r in rows if r[0] in set(all_failed)]
+        retry_saved, all_failed, retry_tokens = _process_sequential_fallback(
+            client, args.model, failed_rows, data_dir
+        )
+        all_saved.extend(retry_saved)
+        retry_input_chars = sum(len(r[2]) + len(r[3]) for r in failed_rows)
+        retry_cost = log_batch_to_langsmith(
+            parent_run_id=parent_run_id,
+            batch_index=len(sub_batches),
+            model=args.model,
+            num_requests=len(failed_rows),
+            input_chars=retry_input_chars,
+            output_audio_tokens=retry_tokens,
+            input_tokens=retry_input_chars // 4,
+        )
+        cumulative_cost += retry_cost
+        print(f"  Retry: saved={len(retry_saved)}, still_failed={len(all_failed)}")
 
     # ---- Report failures ----
     if all_failed:
