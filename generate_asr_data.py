@@ -5,7 +5,6 @@ API and tracks costs via LangSmith.
 """
 
 import argparse
-import base64
 import csv
 import hashlib
 import os
@@ -170,20 +169,22 @@ def make_filename(index: int, voice: str, style: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_request(model: str, text: str, style: str, voice: str) -> dict:
-    """Build a single GenerateContentRequest dict for the Batch API."""
-    return {
-        "model": f"models/{model}",
-        "contents": [{"parts": [{"text": f"{style}\n\n{text}"}]}],
-        "generation_config": {
-            "response_modalities": ["AUDIO"],
-            "speech_config": {
-                "voice_config": {
-                    "prebuilt_voice_config": {"voice_name": voice}
-                }
-            },
-        },
-    }
+def _build_request(model: str, text: str, style: str, voice: str) -> types.InlinedRequest:
+    """Build a single InlinedRequest for the Batch API."""
+    return types.InlinedRequest(
+        model=f"models/{model}",
+        contents=[{"parts": [{"text": f"{style}\n\n{text}"}]}],
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice,
+                    )
+                )
+            ),
+        ),
+    )
 
 
 def wait_for_batch(client, batch_name: str, poll_interval: int = 15):
@@ -231,7 +232,7 @@ def _process_batch_api(
         idx, filename, text, style, voice = sub_batch[i]
         try:
             audio_data = response.candidates[0].content.parts[0].inline_data.data
-            pcm_bytes = base64.b64decode(audio_data)
+            pcm_bytes = audio_data
             filepath = data_dir / filename
             save_wave(filepath, pcm_bytes)
             duration = get_duration(filepath)
@@ -281,7 +282,7 @@ def _process_sequential_fallback(
                 ),
             )
             audio_data = response.candidates[0].content.parts[0].inline_data.data
-            pcm_bytes = base64.b64decode(audio_data)
+            pcm_bytes = audio_data
             filepath = data_dir / filename
             save_wave(filepath, pcm_bytes)
             duration = get_duration(filepath)
@@ -407,7 +408,7 @@ def main() -> None:
     all_failed: list[int] = []
     cumulative_cost = 0.0
 
-    use_batch_api = True
+    use_batch_api = False
 
     for bi, sub_batch in enumerate(tqdm(sub_batches, desc="Batches")):
         input_chars = sum(len(r[2]) + len(r[3]) for r in sub_batch)
